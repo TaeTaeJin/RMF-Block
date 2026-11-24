@@ -25,9 +25,11 @@ it to hold anything else. On it:
   both places; here the third is named 기타, since "문서" would read as the file's source.
 - **A table**, newest first: name, source, size, uploaded by, date (FR-050-02).
 - **Per row**: 미리보기 (FR-050-03, below) for the types the preview route serves inline
-  ([`api.md`](api.md#files)); 기타 is download-only until UC-080's viewers exist. `kindOf` files any
+  ([`api.md`](api.md#files)). Any other row says 미리보기 불가 in its place, as text rather than a
+  button (FR-080-05), so 기타 is download-only until UC-080's viewers exist. `kindOf` files any
   `image/*` under 이미지, so a chat SVG sits there but is download-only. 원본 위치 (E3-3) and 내려받기
-  (FR-050-04).
+  (FR-050-04). The chat's file list, its file cards and a document's file block say 미리보기 불가 the
+  same way (`PREVIEW_UNAVAILABLE` in `app/(workspace)/ui.tsx`).
 
 The list is fetched when the page opens. Nothing asks for it to update live.
 
@@ -58,7 +60,7 @@ Rather than record it at upload, `GET /api/files` reads it from the documents on
 - One Yorkie Admin `GetDocuments` call returns every catalogue document's root (`include_root`).
   It is a project API, so it is authorized with the default project's secret key (from
   `GetProject`, after logging in with `YORKIE_ADMIN_PASSWORD`) — the way Yorkie's own dashboard
-  does it. With the admin token instead, Yorkie 0.7.23 drops the connection. A key Yorkie holds no
+  does it. With the admin token instead, Yorkie answers 403 `permission_denied`. A key Yorkie holds no
   document for — a catalogue entry nobody has opened — is left out of the answer, not an error.
 - The root comes back as plain JSON (a `yorkie.Text` as `[{"val":…}]`), so the file, image and PDF
   blocks and their `content.fileId` are read without the SDK (`lib/files/workspace-files.ts`).

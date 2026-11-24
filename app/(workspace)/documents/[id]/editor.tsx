@@ -4,36 +4,29 @@ import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
-import {
-  createChecklist,
-  createCode,
-  createDivider,
-  createBlockLink,
-  createDocLink,
-  createHeading,
-  createList,
-  createQuote,
-  createText,
-  createTable,
-} from "@/lib/blocks/create";
-import { deleteTableAxis, insertTableAxis } from "@/lib/blocks/table";
+import { createDivider, createBlockLink, createDocLink, createTable } from "@/lib/blocks/create";
+import { deleteTableAxis, fillTable, insertTableAxis } from "@/lib/blocks/table";
 import { BLOCK_KINDS, continuationBlock, isTextBearing } from "@/lib/blocks/registry";
 import type { SlashAction } from "@/lib/blocks/slash-menu";
 import { readBlocks, toStoredBlock, type BlockDocumentRoot, type StoredBlock } from "@/lib/blocks/document";
 import type { MarkdownShortcut } from "@/lib/blocks/markdown-shortcuts";
 import {
-  appendBlock,
   BlockNotFoundError,
   changeBlockType,
   editBlockText,
   insertBlockAfter,
+  keepTrailingText,
   moveBlockAfter,
   removeBlock,
+  removeBlocks,
+  trailingTextId,
   type BlockArray,
+  type TypeFields,
 } from "@/lib/blocks/operations";
 import { indentedDepth, preservingDepth } from "@/lib/blocks/indent";
-import { parsePaste, type PastedLine } from "@/lib/blocks/paste";
+import { parsePaste, pastedBlock, type PastedLine } from "@/lib/blocks/paste";
 import { orderedListNumbers } from "@/lib/blocks/list-numbering";
+import { blocksToMarkdown } from "@/lib/blocks/markdown";
 import {
   dropDestination,
   dropsBeforeTarget,
@@ -61,6 +54,7 @@ import { PdfBlockView } from "./pdf-block";
 import { TableBlockView } from "./table-block";
 import { TextBlockView, type BlockVariant } from "./text-block";
 import { useBlockDocument } from "./use-block-document";
+import { useBlockSelection } from "./use-block-selection";
 import { VersionHistory } from "./version-history";
 import { useFocusPresence } from "./use-focus-presence";
 import { useFileUpload } from "./use-file-upload";
@@ -85,6 +79,13 @@ function UnsupportedBlock({ type }: { type: BlockType }) {
       아직 편집할 수 없는 블록입니다 ({type}).
     </p>
   );
+}
+
+type PastedTextLine = PastedLine & { fields: Extract<PastedLine["fields"], TypeFields> };
+
+/** A pasted block with text of its own — not a divider, and not a table, whose text is in its cells. */
+function holdsText(line: PastedLine): line is PastedTextLine {
+  return BLOCK_KINDS[line.fields.type].surface === "text";
 }
 
 function variantOf(block: Extract<Block, { text: string }>): BlockVariant {
@@ -211,6 +212,14 @@ export function DocumentEditor({
   const focusBlock = (blockId: BlockId, caret: number) => {
     pendingFocusRef.current = { blockId, caret };
   };
+  /** `false` if the block has no textarea in the DOM right now. */
+  function focusAtEnd(blockId: BlockId): boolean {
+    const el = elementsRef.current.get(blockId);
+    if (!el) return false;
+    el.focus();
+    el.setSelectionRange(el.value.length, el.value.length);
+    return true;
+  }
 
   useEffect(() => {
     const pending = pendingFocusRef.current;
@@ -248,6 +257,26 @@ export function DocumentEditor({
     clearScrollTarget,
     pauseFollow: pause,
   });
+
+  const { selected: selectedBlocks, selectAll: selectAllBlocks, proxyProps } = useBlockSelection({
+    order,
+    listRef: scrollContainerRef,
+    markdownOf: (ids) => {
+      const doc = docRef.current;
+      if (!doc) return "";
+      return blocksToMarkdown(readBlocks(doc.getRoot().blocks), window.location.origin, ids);
+    },
+    focusText: focusAtEnd,
+    deleteBlocks: handleDeleteBlocks,
+  });
+
+  // The selected blocks a floating view can show, in order — what a selected
+  // row's float button opens as one window when there are several
+  // (`docs/design/floating-view.md`, "Several blocks in one window").
+  const floatableSelection = useMemo(
+    () => (blocks ?? []).filter((block) => selectedBlocks?.has(block.id) && canFloat(block)).map((block) => block.id),
+    [blocks, selectedBlocks],
+  );
 
   /** Read live, never from `blocks` state, and by iteration rather than `.find`
    *  — why both: `docs/design/document-editing.md`. */
@@ -292,31 +321,21 @@ export function DocumentEditor({
     const doc = docRef.current;
     if (!doc) return null;
 
-    const root = doc.getRoot();
-    const last = root.blocks[root.blocks.length - 1];
-    const lastIsEmptyText = last?.type === "text" && (last.content?.text?.toString() ?? "") === "";
-    if (lastIsEmptyText) return last.id;
+    const existing = trailingTextId(doc.getRoot().blocks);
+    if (existing) return existing;
 
     // Returns the block it guarantees — the one that was already there, or the
     // one it just made. Callers that only want the invariant can ignore it;
     // `focusEndOfDocument` needs to know where to put the caret.
-    const block = toStoredBlock(createText());
-    return applyEdit((_root, blocks) => appendBlock(blocks, block)) ? block.id : null;
+    let id: BlockId | null = null;
+    return applyEdit((_root, blocks) => { id = keepTrailingText(blocks); }) ? id : null;
   };
 
   /** A click on the empty space below lands the caret at the end — making a
    *  trailing block first if the document ends in one that cannot hold it. */
   const focusEndOfDocument = () => {
     const last = blocks?.[blocks.length - 1];
-
-    if (last && isTextBearing(last)) {
-      const el = elementsRef.current.get(last.id);
-      if (el) {
-        el.focus();
-        el.setSelectionRange(el.value.length, el.value.length);
-        return;
-      }
-    }
+    if (last && isTextBearing(last) && focusAtEnd(last.id)) return;
 
     // The new block does not exist in the DOM yet, so this goes through the
     // pending-focus request the split/merge handlers use: the `setBlocks`
@@ -539,34 +558,20 @@ export function DocumentEditor({
     focusBlock(newBlockId ?? blockId, 0);
   };
 
-  /** The empty block a pasted line becomes, before its text is written into it.
-   *  `create.ts` is the one place a block of each type is built. */
-  const blockFor = (fields: PastedLine["fields"]): Block => {
-    switch (fields.type) {
-      case "heading":
-        return createHeading(fields.level);
-      case "list":
-        return createList(fields.style);
-      case "checklist":
-        // `createChecklist` is always unchecked — "a task that is already done
-        // is not a task anyone adds" — which holds for a new one and not for a
-        // pasted one, where `[x]` is the whole point of writing it.
-        return { ...createChecklist(), checked: fields.checked };
-      case "quote":
-        return createQuote();
-      case "code":
-        return createCode();
-      case "text":
-        return createText();
+  /** Puts one pasted block after `afterId` with its text, and returns its id. */
+  const insertPasted = (array: BlockArray, afterId: BlockId | null, line: PastedLine): BlockId => {
+    const block = pastedBlock(line);
+    insertBlockAfter(array, afterId, toStoredBlock(block));
+    if (block.type === "table") {
+      fillTable(array, block);
+    } else if (line.text) {
+      editBlockText(array, block.id, 0, 0, line.text);
     }
+    return block.id;
   };
 
-  /**
-   * A paste carrying newlines (FR-022-01). The first line replaces the pasted-into
-   * block's text and takes its type; the rest become blocks after it. Why a
-   * single-line paste never reaches here: `docs/design/document-editing.md`,
-   * "Pasting more than one line".
-   */
+  /** A paste carrying newlines (FR-022-01): `docs/design/document-editing.md`,
+   *  "Pasting more than one line". */
   const handlePaste = (blockId: BlockId, text: string) => {
     if (!blocks) return;
 
@@ -580,30 +585,41 @@ export function DocumentEditor({
       return;
     }
 
-    const lines = parsePaste(text);
-    const first = lines[0];
-    if (!first) return;
+    // A pasted list nests under the list item it is pasted into.
+    const current = blockOf(blockId);
+    const baseDepth = current?.type === "list" ? current.depth : 0;
+    const lines = parsePaste(text).map((line): PastedLine =>
+      line.fields.type === "list" ? { ...line, fields: { ...line.fields, depth: baseDepth + line.fields.depth } } : line,
+    );
+    const first = lines.find(holdsText);
+    const index = first ? lines.indexOf(first) : lines.length;
 
-    let lastId: BlockId = blockId;
+    // Where the caret goes: the end of the last pasted block with text.
+    const caret = { id: blockId, at: first?.text.length ?? 0 };
     // What the document did to the pasted-into block, so the same can be done to
     // its textarea afterwards — the shape `handleSplit` uses for the same reason.
     let replaced: TextPatch | null = null;
 
     const applied = applyEdit((root, array) => {
-      // The first line lands in the block that already has the caret. Its whole
-      // text is replaced rather than inserted into: a multi-line paste is a
-      // structural edit, and splitting a word into a heading is not what anyone
-      // means by one.
+      let above = idBeforeInOrder(order, blockId);
+      for (const line of lines.slice(0, index)) above = insertPasted(array, above, line);
+      if (!first) return;
+
+      // Its whole text is replaced rather than inserted into: a multi-line paste
+      // is a structural edit, and splitting a word into a heading is not what
+      // anyone means by one.
       const liveText = liveTextOf(root, blockId);
-      changeBlockType(array, blockId, preservingDepth(first.fields, blockOf(blockId)));
+      changeBlockType(array, blockId, first.fields);
       editBlockText(array, blockId, 0, liveText.length, first.text);
       replaced = { from: 0, to: liveText.length, value: { content: first.text } };
 
-      for (const line of lines.slice(1)) {
-        const block = toStoredBlock(blockFor(line.fields));
-        insertBlockAfter(array, lastId, block);
-        if (line.text) editBlockText(array, block.id, 0, 0, line.text);
-        lastId = block.id;
+      let lastId = blockId;
+      for (const line of lines.slice(index + 1)) {
+        lastId = insertPasted(array, lastId, line);
+        if (holdsText(line)) {
+          caret.id = lastId;
+          caret.at = line.text.length;
+        }
       }
     });
 
@@ -612,7 +628,7 @@ export function DocumentEditor({
     // Same reason as a split: the textarea is uncontrolled and read its text
     // once, so the document's change has to be shown to it by hand (#59).
     if (replaced) patchBlockText(blockId, replaced);
-    focusBlock(lastId, lines[lines.length - 1]!.text.length);
+    if (first) focusBlock(caret.id, caret.at);
   };
 
   /** Backspace at offset 0 (FR-022-03): append to the previous block, remove this
@@ -698,10 +714,27 @@ export function DocumentEditor({
    *  calls, having no caret to Backspace in. `BlockNotFoundError` means a peer
    *  got there first, which is the outcome this asked for. */
   const handleDeleteBlock = (blockId: BlockId) => {
-    if (!applyEdit((_root, blocks) => removeBlock(blocks, blockId))) return;
-
-    ensureTrailingEmptyBlock();
+    // With the trailing block in the same update, one undo takes back both.
+    applyEdit((_root, blocks) => {
+      removeBlock(blocks, blockId);
+      keepTrailingText(blocks);
+    });
   };
+
+  /** Backspace/Delete on a whole-block selection (`docs/design/document-editing.md`,
+   *  "Selecting and copying blocks"). */
+  function handleDeleteBlocks(ids: Set<BlockId>) {
+    const start = order.findIndex((id) => ids.has(id));
+    if (!blocks || start < 0) return;
+    let caretId = blocks.slice(start).find((block) => !ids.has(block.id) && isTextBearing(block))?.id;
+
+    const applied = applyEdit((_root, array) => {
+      removeBlocks(array, ids);
+      const trailing = keepTrailingText(array);
+      caretId ??= trailing;
+    });
+    if (applied && caretId) focusBlock(caretId, 0);
+  }
 
   /** Read synchronously — a `DataTransfer` is only valid for the duration of the
    *  event, so the `File`s must come out before the first `await`. */
@@ -831,6 +864,7 @@ export function DocumentEditor({
             }}
             onIndent={handleIndent}
             onPasteBlocks={handlePaste}
+            onSelectAllBlocks={selectAllBlocks}
             onHistory={history}
           />
         </div>
@@ -959,9 +993,12 @@ export function DocumentEditor({
         : null}
       <div className={COLUMN}>
       <div className={TITLE_ROW}>{title}</div>
+      <textarea {...proxyProps} />
       <div className="flex flex-col gap-1.5">
       {blocks.map((block, index) => {
         const occupant = occupantByBlock.get(block.id);
+        const floatsGroup = floatableSelection.length > 1 && !!selectedBlocks?.has(block.id);
+        const floatLabel = floatsGroup ? "선택한 블록을 플로팅 뷰로 열기" : "플로팅 뷰로 열기";
         // The drop indicator wins outright while dragging over this block's
         // border — an occupant's box outline and the before/after line would
         // otherwise fight over the same border sides. The gutter avatar below
@@ -983,9 +1020,10 @@ export function DocumentEditor({
           // (`use-block-document.ts`, `replaceBlocks`).
           key={`${block.id}:${restoreCount}`}
           data-block-id={block.id}
+          data-selected={selectedBlocks?.has(block.id) || undefined}
           className={`group relative ${
             block.id === draggedId ? "rounded-control bg-sky-soft opacity-50" : ""
-          } ${
+          } data-selected:rounded-control data-selected:bg-sky-soft ${
             dropIndicator?.targetId === block.id
               ? dropIndicator.before
                 ? "border-t-2 border-sky-deep"
@@ -1054,9 +1092,13 @@ export function DocumentEditor({
           {canFloat(block) ? (
             <button
               type="button"
-              onClick={() => openFloating({ documentId, blockId: block.id })}
-              aria-label="플로팅 뷰로 열기"
-              title="플로팅 뷰로 열기"
+              // Marked only when it opens the selection, which its press must then keep.
+              data-selection-action={floatsGroup || undefined}
+              onClick={() =>
+                openFloating(floatsGroup ? { documentId, blockIds: floatableSelection } : { documentId, blockId: block.id })
+              }
+              aria-label={floatLabel}
+              title={floatLabel}
               className="absolute top-[3px] -left-[50px] flex size-6 items-center justify-center rounded text-ink-faint opacity-0 transition-opacity duration-[120ms] group-hover:opacity-100 group-focus-within:opacity-100 hover:bg-hover hover:text-ink-soft focus:opacity-100"
             >
               <svg aria-hidden width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.4} strokeLinejoin="round">

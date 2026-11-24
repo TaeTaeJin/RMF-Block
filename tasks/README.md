@@ -24,8 +24,10 @@ the task files, then rerun — never edit an index by hand, the next run overwri
 
 | Task | Lessons |
 | :--- | :--- |
+| [Several selected blocks in one floating view](active/20261118-floating-block-group-todo.md) | [lessons](active/20261118-floating-block-group-lessons.md) |
+| [Delete and cut a whole-block selection](active/20261118-block-selection-delete-todo.md) | [lessons](active/20261118-block-selection-delete-lessons.md) |
+| [Upgrade Yorkie and the JS SDK 0.7.23 → 0.7.28](active/20261117-yorkie-0728-todo.md) | [lessons](active/20261117-yorkie-0728-lessons.md) |
 | [Simple collaborative table blocks](active/20261016-table-block-todo.md) | [lessons](active/20261016-table-block-lessons.md) |
-| [Admin and user-location E2E after admin integration](active/20261007-admin-e2e-todo.md) | [lessons](active/20261007-admin-e2e-lessons.md) |
 
 ## Archive
 

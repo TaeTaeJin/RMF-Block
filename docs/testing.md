@@ -187,6 +187,17 @@ a browser run costs seconds per test against milliseconds.
   Run it three times to check repeatability on independent stacks. Arguments pass through to
   Playwright, e.g. `pnpm e2e:isolated --grep diagnostic`, or `--grep-invert @slow` to skip the
   20-second outage while iterating.
+- **Lifecycle stack.** `pnpm e2e:isolated --lifecycle` starts a stack with no `WORKSPACE_PASSWORD` and runs
+  only `e2e/lifecycle/`, which opens the workspace from the setup screen, restarts the app, kills the app and Yorkie and
+  starts a second app with a Yorkie admin password Yorkie rejects. They run in order on that one stack and use `docker compose`
+  through `e2e/stack.ts`, which refuses to run without the runner's `E2E_COMPOSE_PROJECT`, so they are not part
+  of `pnpm e2e` or CI and cannot touch a real stack. FR-010-03 and FR-010-06 are the startup banner and the
+  refusal printed to container stdout, which is the host's screen, so they assert on the app's log.
+- **Other browsers.** CI and a plain run use Chromium only. `E2E_BROWSERS=all pnpm e2e:isolated --project=firefox --project=webkit`
+  (after `pnpm exec playwright install firefox webkit`; WebKit also needs the system libraries from `playwright install-deps webkit`)
+  runs the suite on Firefox and Playwright's WebKit build; `--project=msedge` runs it on the installed Edge (`pnpm exec playwright install msedge`,
+  which asks for `sudo`). Safari is approximated by WebKit and not run as such. Specs that need a CDP session call `chromiumOnly()` and show
+  as skipped outside the `chromium` project.
 - **Existing stacks.** `E2E_WORKSPACE_PASSWORD=<password> E2E_HOST_SECRET=<startup-secret> pnpm e2e`
   targets an already running container (`pnpm docker:up`). `E2E_BASE_URL` defaults to
   `http://localhost:3000`. Use a disposable stack nobody else is connected to: tests assert exact
@@ -209,11 +220,15 @@ a browser run costs seconds per test against milliseconds.
   that run. Repeated runs on a shared stack still accumulate members. A second tab shares its user's context. API
   joining/document creation prepare data; password admission, takeover, tree actions, chat send
   and attachment upload under test use the UI.
+- **Writing a spec.** Run a new one with `--repeat-each=3` on one stack before trusting it: members and chat
+  history are shared, so a second run finds the first one's rows, and anything sent to chat carries `Date.now()`.
+  A spec that changes workspace state every later spec relies on (the access password) restores it in
+  `test.afterEach`, not a `finally` — after a timeout the body keeps running while the fixtures close.
 - **Coverage.** Existing sync, Hangul IME and image-preview regressions remain. Tests additionally
   cover guest/host admission, takeover cancel/confirm and third-party isolation, tab deduplication,
   arrival/departure, bidirectional/late/reloaded reads, concurrent same-position insertion and
   disjoint-range edits, split/merge ordering, local undo/redo preserving remote input, eight-user
-  block/shared-text convergence, live tree create/rename/move/delete, document tabs and the sidebar rail, host restore of a deleted document from `/admin`, chat sender attribution and
+  block/shared-text convergence, live tree create/rename/move/delete, document tabs and the sidebar rail, host restore of a deleted document from `/admin`, `/admin` and its APIs refusing a guest or visitor, a password change that keeps a connected guest and admits only the new password, kick cancel/confirm with the kicked guest's notice and rejoin, a jump from a tree dot to a colleague's block and back, markup and script-shaped text staying inert for another user, a document or chat file downloading byte for byte, cancelling a file block's deletion, chat sender attribution and
   remote attachment preview. Recovery holds an activated client offline for 20 seconds while both
   sides edit, then checks convergence and chat backfill/deduplication.
 - **Anchors and timing.** Capture block IDs and address `[data-block-id="<id>"] textarea`; inspect
@@ -244,8 +259,8 @@ a browser run costs seconds per test against milliseconds.
 - **CI.** Expanded tests run after the existing smoke test on its container, with E2E's
   `continue-on-error` policy preserved. CI masks the bootstrap secret and uploads failure traces,
   the HTML report and redacted server logs.
-- **Follow-up.** Admin setup/access/password/kick/restart plus integrated user-location navigation
-  are tracked in [the admin E2E task](../tasks/active/20261007-admin-e2e-todo.md). Long-running load, 1-second propagation, 500MB client memory and real LAN
+- **Follow-up.** Unseeded admin setup and restart persistence need a stack started without
+  `WORKSPACE_PASSWORD` and an app restart mid-test; they are tracked in [the admin E2E task](../tasks/archive/2026/10/20261007-admin-e2e-todo.md). Long-running load, 1-second propagation, 500MB client memory and real LAN
   devices are the performance harness's (`e2e/perf/`, #189): `pnpm perf` on the measurement rig, outside `pnpm e2e`
   and CI, run by hand from [the runbook](perf/runbook-ko.md); its arithmetic (`e2e/perf/stats.mts`, the result charts' curve included), NFR-PER-003's join attempt and the port check have Vitest tests.
   The observation stack (`pnpm perf:observe`, #192) is diagnostics only and is checked by hand with an observed round.

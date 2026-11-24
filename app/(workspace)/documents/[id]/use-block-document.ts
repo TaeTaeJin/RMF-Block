@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { cellKey, fillTable, readTable, tableCellPatches, type CellChange } from "@/lib/blocks/table";
 import { createText } from "@/lib/blocks/create";
+import { blocksFromMarkdown } from "@/lib/blocks/markdown-import";
 import { readBlocks, toStoredBlock, type BlockDocumentRoot } from "@/lib/blocks/document";
 import { editBlockText, type BlockArray } from "@/lib/blocks/operations";
 import {
@@ -12,6 +13,7 @@ import {
 } from "@/lib/documents/attach-pool";
 import {
   blockIndexFromEditPath,
+  replacesBlockList,
   touchesBlockList,
   type TextPatch,
 } from "@/lib/blocks/text-surface";
@@ -22,6 +24,8 @@ import {
   OCCUPANCY_TICK_MS,
   type Occupant,
 } from "@/lib/presence/occupancy";
+
+import { takeImport } from "../../pending-import";
 
 const TABLE_CELL_TEXT = /\.content\.table\.cells\.\d+\.text$/;
 
@@ -37,8 +41,16 @@ export function useBlockDocument(
   nickname: string,
 ) {
   const [blocks, setBlocks] = useState<Array<Block> | null>(null);
-  /** Bumped by `replaceBlocks`, and part of every row's key — see there. */
+  /** Bumped by `replaceBlocks`, and part of every row's key — see there. A peer's
+   *  restore bumps it too, below. */
   const [restoreCount, setRestoreCount] = useState(0);
+  /** How many remounts were asked for; `restoreCount` equals it once the newest has committed. */
+  const remountsRef = useRef(0);
+  /** A peer replaced the list and the rows have not remounted: edits are read, not patched (#276). */
+  const replacingRef = useRef(false);
+  useEffect(() => {
+    if (restoreCount === remountsRef.current) replacingRef.current = false;
+  }, [restoreCount]);
   /** How deep the undo stack was once this document was ready — see where it is
    *  set. `canUndo` alone would let a person undo the document out of existence. */
   const undoFloorRef = useRef(0);
@@ -109,12 +121,24 @@ export function useBlockDocument(
       doc.update((_root, presence) => presence.set({ colorTag, nickname }));
 
       // Two peers can both seed an empty document — a known `#42`-material race
-      // (`docs/design/document-editing.md`).
+      // (`docs/design/document-editing.md`). One made from a Markdown file is
+      // seeded with its blocks (`docs/design/app-shell.md`, "Importing Markdown").
+      const seed = blocksFromMarkdown(takeImport(documentId) ?? "");
+      if (seed.length === 0) seed.push(createText());
       doc.update((root: BlockDocumentRoot) => {
         if (!root.blocks || root.blocks.length === 0) {
-          root.blocks = [toStoredBlock(createText())];
+          root.blocks = seed.map(toStoredBlock);
         }
       });
+      // Strings only after their empty CRDT nodes are in, as `replaceBlocks` does.
+      const texts = seed.flatMap((block) => ("text" in block && block.text ? [{ id: block.id, text: block.text }] : []));
+      const tables = seed.flatMap((block) => (block.type === "table" ? [block] : []));
+      if ((texts.length > 0 || tables.length > 0) && doc.getRoot().blocks[0]?.id === seed[0]!.id) {
+        doc.update((root: BlockDocumentRoot) => {
+          for (const { id, text } of texts) editBlockText(root.blocks as BlockArray, id, 0, 0, text);
+          for (const table of tables) fillTable(root.blocks as BlockArray, table);
+        });
+      }
 
       docRef.current = doc;
       // Nothing before this point may be undone. The seed above is a
@@ -142,6 +166,19 @@ export function useBlockDocument(
         let needsRecompute = false;
 
         for (const op of event.value.operations) {
+          // A restore elsewhere keeps the block ids; a new key remounts the rows (#276).
+          if (replacesBlockList(op)) {
+            replacingRef.current = true;
+            setRestoreCount(++remountsRef.current);
+            needsRecompute = true;
+            continue;
+          }
+          // The new rows may already have mounted from an older list: remount them again.
+          if (op.type === "edit" && replacingRef.current) {
+            setRestoreCount(++remountsRef.current);
+            needsRecompute = true;
+            continue;
+          }
           if (op.type === "edit") {
             const index = blockIndexFromEditPath(op.path);
             if (index === null) {
@@ -172,8 +209,9 @@ export function useBlockDocument(
           }
         }
 
-        const edits = event.value.operations.filter((op) => op.type === "edit");
-        const touchedTables = event.value.operations.some((op) => op.path.includes(".content.table"));
+        // Cells of rows about to remount read their text when they mount.
+        const edits = replacingRef.current ? [] : event.value.operations.filter((op) => op.type === "edit");
+        const touchedTables = !replacingRef.current && event.value.operations.some((op) => op.path.includes(".content.table"));
         for (const { key, patch } of tableCellPatches(doc.getRoot().blocks, edits)) {
           const handler = cellHandlersRef.current.get(key);
           if (handler) handler(patch);
@@ -309,7 +347,7 @@ export function useBlockDocument(
     setBlocks(readBlocks(doc.getRoot().blocks));
     // Remounts every row: a reused one keeps its pre-restore text and diff
     // baseline (`docs/design/version-history.md`, "Why the app restores").
-    setRestoreCount((count) => count + 1);
+    setRestoreCount(++remountsRef.current);
   }, []);
 
   return {

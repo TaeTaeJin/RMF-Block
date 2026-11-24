@@ -402,6 +402,10 @@ process lives on without ever listening. In a container that is the worst outcom
 Docker sees a running service, `restart` never fires, and compose reports no failure while the
 workspace looks up and serves nothing.
 
+Each Admin request is cut off after 10 s, so a Yorkie that accepts the connection and never answers
+ends in this refusal too, rather than in a startup that waits for ever (#258). The retry still
+applies: that case is refused after about five minutes. A rejected password (401) is not retried.
+
 In development it is not fatal — Yorkie is often simply not running and most work does not need
 it — but it is printed loudly, because this is the one state where the app looks fine and is
 protecting nothing. The successful registration is printed too: Yorkie stores the webhook URL
@@ -419,7 +423,8 @@ default: when the configured password is refused and `admin` is not, startup rot
 `ChangePassword`, whose rule (8–30 characters with letters, digits and a symbol) the password has to
 meet for that reason. A volume on neither password refuses to start. The admin tokens Yorkie issues
 are signed with `--backend-secret-key`, whose default (`yorkie-secret`) is just as public, so Compose
-requires `YORKIE_ADMIN_TOKEN_SECRET` for it the same way; only Yorkie reads it, and since the app
+requires `YORKIE_ADMIN_TOKEN_SECRET` for it the same way, and Yorkie itself (0.7.25 on) refuses one
+under 32 characters; only Yorkie reads it, and since the app
 logs in afresh on every start, changing it costs nothing but open admin sessions. Compose's `:?`
 only rejects an empty value, so Yorkie's entrypoint also refuses to start when `.env` spells out
 either default (`admin`, `yorkie-secret`) — the app would refuse too, but Yorkie runs in its own
