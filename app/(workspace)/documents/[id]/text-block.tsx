@@ -2,6 +2,7 @@
 
 import type { Document } from "@yorkie-js/sdk";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 
 import { cellKey, editTableCell, type CellAddress, type CellChange } from "@/lib/blocks/table";
 import { hasMarks, parseInline, SHORTCUT_MARKERS, toggleMarker } from "@/lib/blocks/inline-markdown";
@@ -196,6 +197,9 @@ export function TextBlockView({
   // means — Enter splits.
   const slashOpen = slashItems.length > 0;
   const slashListRef = useRef<HTMLUListElement>(null);
+  // The query Escape closed. Without it the next keystroke recomputes the same
+  // query off the text and the menu is back (#148).
+  const dismissedSlashRef = useRef<string | null>(null);
 
   // Keeps the highlighted row on screen: the items can overflow the menu's max height, so
   // arrow keys used to move the highlight somewhere nobody could see. The
@@ -224,10 +228,22 @@ export function TextBlockView({
    *  too — it only moves the menu, never Yorkie — so `/제` narrows while 제 is
    *  still being composed. Behind the composing guard, a query typed through an
    *  IME never reached the menu at all (#103). */
-  const syncSlashQuery = (el: HTMLTextAreaElement) => {
+  const detectSlash = (value: string) =>
     // Every type but code, where `/` is source text (`docs/design/
     // document-editing.md`, "Leaving a code block").
-    const query = cellBinding || variant.type === "code" ? null : detectSlashQuery(el.value);
+    cellBinding || variant.type === "code" ? null : detectSlashQuery(value);
+
+  // Stays closed while the text extends what was dismissed; deleting back
+  // past it, a space or a newline (no query at all) lets it open again.
+  const expireSlashDismissal = (detected: string | null) => {
+    const dismissed = dismissedSlashRef.current;
+    if (dismissed !== null && !detected?.startsWith(dismissed)) dismissedSlashRef.current = null;
+  };
+
+  const syncSlashQuery = (el: HTMLTextAreaElement) => {
+    const detected = detectSlash(el.value);
+    expireSlashDismissal(detected);
+    const query = dismissedSlashRef.current === null ? detected : null;
     if (query !== slashQuery) setSlash(query);
   };
 
@@ -260,8 +276,14 @@ export function TextBlockView({
   const lastSyncedRef = useRef(initialText);
 
   // `document-editing.md`, "Inline formatting". `shown` is the text drawn while
-  // the block is not focused; it is not kept in step while it is.
+  // the block is not focused, and what it prints; it is not kept in step while
+  // focused, except just before a print.
   const drawsInline = !cellBinding && variant.type !== "code";
+  // The text's box, shared by the textarea, the inline drawing over it and the
+  // print copy, so a printout matches the screen.
+  const box = `${TEXT_INSET} ${textareaClass(variant)}`;
+  // Where the textarea and the print copy sit in the block's row.
+  const flow = `${cellBinding ? "w-full" : ""} min-w-0 flex-1`;
   const [focused, setFocused] = useState(false);
   const [shown, setShown] = useState(initialText);
   const overlayRef = useRef<HTMLDivElement>(null);
@@ -288,6 +310,18 @@ export function TextBlockView({
     };
   }, [formatted]);
 
+  // Ctrl+P can come from inside a block, whose `shown` lags its textarea; every
+  // other block's is current. Synchronous, or the print would be laid out first.
+  useEffect(() => {
+    if (!focused) return;
+    const sync = () => {
+      const el = textareaRef.current;
+      if (el) flushSync(() => setShown(el.value));
+    };
+    window.addEventListener("beforeprint", sync);
+    return () => window.removeEventListener("beforeprint", sync);
+  }, [focused]);
+
 
   /** Outside a composition the textarea and Yorkie hold the same text, so a
    *  patch lands at its own offsets. */
@@ -299,6 +333,9 @@ export function TextBlockView({
     el.value = el.value.slice(0, from) + value.content + el.value.slice(to);
     lastSyncedRef.current = el.value;
     if (el !== document.activeElement) setShown(el.value);
+    // A peer's edit can remove the dismissed query without any input event
+    // here, which would leave its dismissal suppressing a fresh `/`.
+    expireSlashDismissal(detectSlash(el.value));
 
     const insertedLength = value.content.length;
     const newStart = shiftCaret(selStart, { from, to, insertedLength });
@@ -425,6 +462,7 @@ export function TextBlockView({
         // Escape dismisses the no-results row as well as the menu.
         if (slashQuery !== null && event.key === "Escape") {
           event.preventDefault();
+          dismissedSlashRef.current = slashQuery;
           setSlash(null);
           return;
         }
@@ -617,6 +655,7 @@ export function TextBlockView({
       onBlur={(event) => {
         // Nothing to type into once focus leaves, so neither the menu nor its
         // 결과 없음 row should outlive it next to a block nobody is in.
+        dismissedSlashRef.current = null;
         setSlash(null);
         setFocused(false);
         setShown(event.currentTarget.value);
@@ -628,7 +667,7 @@ export function TextBlockView({
       // it marks the one block being typed in rather than every empty one —
       // the `/` menu shipped in #63 with nothing in the UI naming it.
       placeholder={!cellBinding && variant.type === "text" ? "'/'를 입력해 명령어 사용" : undefined}
-      className={`${cellBinding ? "w-full" : ""} min-w-0 flex-1 resize-none overflow-hidden ${TEXT_INSET} outline-none placeholder:text-ink-faint placeholder:opacity-0 focus:placeholder:opacity-100 ${textareaClass(variant)}`}
+      className={`${flow} resize-none overflow-hidden outline-none print:hidden placeholder:text-ink-faint placeholder:opacity-0 focus:placeholder:opacity-100 ${box}`}
       />
 
       {formatted ? (
@@ -637,11 +676,24 @@ export function TextBlockView({
           aria-hidden
           // Placed at the textarea's own offset, so a heading's top margin is not added twice.
           style={{ margin: 0 }}
-          className={`pointer-events-none absolute ${TEXT_INSET} break-words whitespace-pre-wrap ${textareaClass(variant)}`}
+          className={`pointer-events-none absolute break-words whitespace-pre-wrap print:hidden ${box}`}
         >
           <InlineText text={shown} />
         </div>
       ) : null}
+
+      {/* What prints instead of the textarea (FR-022-17): a textarea's height is
+       *  set by script to the lines it wrapped into on screen, and a page is
+       *  narrower, so the extra lines would be cut off. A div wraps at any width
+       *  in every browser — `docs/design/document-export.md`, "Printing". */}
+      <div
+        aria-hidden
+        data-print-copy
+        className={`${flow} hidden min-h-[1lh] break-words whitespace-pre-wrap print:block ${box}`}
+      >
+        {/* As on screen: text with no marks stays literal, its escapes included. */}
+        {drawsInline && marked ? <InlineText text={shown} /> : shown}
+      </div>
 
       {/* Absolutely positioned against the block row, which is already
        * `relative`. That is what keeps this component's contract intact: the

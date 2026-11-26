@@ -6,6 +6,7 @@ import { createText } from "@/lib/blocks/create";
 import { blocksFromMarkdown } from "@/lib/blocks/markdown-import";
 import { readBlocks, toStoredBlock, type BlockDocumentRoot } from "@/lib/blocks/document";
 import { editBlockText, type BlockArray } from "@/lib/blocks/operations";
+import { replaceAllBlocks } from "@/lib/blocks/restore";
 import {
   acquireBlockDocument,
   releaseBlockDocument,
@@ -119,6 +120,11 @@ export function useBlockDocument(
 
       // Not trusted to `acquire` — `docs/design/floating-view.md`.
       doc.update((_root, presence) => presence.set({ colorTag, nickname }));
+      // A re-run (Strict Mode's second pass, a changed nickname) follows the
+      // cleanup that cleared this browser's block. Put it back now, not at the
+      // next heartbeat (#127).
+      const focused = focusedBlockIdRef.current;
+      if (focused) publishActiveBlock(doc, focused);
 
       // Two peers can both seed an empty document — a known `#42`-material race
       // (`docs/design/document-editing.md`). One made from a Markdown file is
@@ -326,23 +332,14 @@ export function useBlockDocument(
 
   /** Replaces every block, which is how a revision is restored — and why the
    *  app restores rather than calling `client.restoreRevision`:
-   *  `docs/design/version-history.md`. Two updates because a `yorkie.Text`
-   *  cannot be edited before it is in the tree. The read afterwards is not
-   *  optional: a local change never comes back through `doc.subscribe`. */
+   *  `docs/design/version-history.md`. One update, so one Ctrl+Z takes the
+   *  whole restore back (#185). The read afterwards is not optional: a local
+   *  change never comes back through `doc.subscribe`. */
   const replaceBlocks = useCallback((next: Array<Block>) => {
     const doc = docRef.current;
     if (!doc) return;
 
-    doc.update((root: BlockDocumentRoot) => {
-      root.blocks = next.map(toStoredBlock);
-    });
-    doc.update((root: BlockDocumentRoot) => {
-      next.forEach((block) => {
-        if (block.type === "table") fillTable(root.blocks as BlockArray, block);
-        const text = "text" in block ? block.text : "";
-        if (text) editBlockText(root.blocks as BlockArray, block.id, 0, 0, text);
-      });
-    });
+    doc.update((root: BlockDocumentRoot) => replaceAllBlocks(root, next));
 
     setBlocks(readBlocks(doc.getRoot().blocks));
     // Remounts every row: a reused one keeps its pre-restore text and diff

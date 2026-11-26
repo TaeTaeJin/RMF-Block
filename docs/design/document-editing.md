@@ -293,7 +293,7 @@ during IME composition. A final text snapshot reconciles structural fragment rem
 replacement; it is not used to infer ordinary edit positions. Scalar block text keeps its existing
 operation routing.
 Version snapshots flatten nested cell Text nodes; restore creates empty CRDT nodes first and
-then fills them, following the existing two-update restore path (including issue #185).
+then fills them in the same update, so a restore is one undo step (#185).
 
 `/table` or `/표` inserts a 3×3 table above the command paragraph and focuses its first cell.
 The first visible row is always a header. Controls stay out of the way until the pointer is over
@@ -470,6 +470,15 @@ run's `release` (which waits for its own setup to settle), so the count goes 1�
 re-attaches. When the count does reach 0, the next `acquire` of that key waits for the detach in
 flight (the chain above, held per key).
 
+### Leaving with edits Yorkie has not received
+
+An edit pushed a moment before a reload, a full navigation or a closed tab can be lost: nothing
+can finish a push while the page unloads. So while an attached document holds changes Yorkie has
+not acknowledged (`hasLocalChanges()`), the pool's `beforeunload` listener asks the browser to
+confirm leaving ([#221](https://github.com/CBNU-TeamH/RMF-Block/issues/221)). It is a warning, not a
+flush, and an in-app route change does not unload, so it never asks there. The listener stays
+through the last release's detach in flight, whose final push is what delivers those changes, and goes once it settles.
+
 ### Seeding a brand-new document is a known race
 
 Two people opening the same empty document at once can both see it empty and both seed it. `blocks`
@@ -564,7 +573,9 @@ marker asks for a conversion that has already happened. The `/` menu opens in **
 block except code** (#145) — in code `/` is source text too, but elsewhere the menu's items are
 conversions *to* another type, so `/텍스트` is how a heading becomes a paragraph again. The `/`
 menu's query is recomputed from the text rather than tracked as a session, so deleting back
-through the slash closes it on its own. It is recomputed mid-composition too, and matched jamo by
+through the slash closes it on its own. The one thing remembered is a query Escape dismissed: while
+the text still extends it the menu stays closed, and deleting back past it, a space or newline, or
+blur clears it — otherwise the next keystroke brought the menu straight back ([#148](https://github.com/CBNU-TeamH/RMF-Block/issues/148)). It is recomputed mid-composition too, and matched jamo by
 jamo (`slashMenuItems`), so the menu narrows at each step an IME shows (`ㅈ`, `제`, `젬`, `제모`)
 instead of waiting for the word.
 
@@ -722,6 +733,8 @@ every block). A table cell keeps Ctrl/Cmd+A as its own. Selected rows are marked
 a short label as its text, selected. Ctrl/Cmd+C is then the browser's ordinary copy, which works
 on a plain-HTTP LAN address where `navigator.clipboard` does not exist, and its `copy` handler
 writes the Markdown, read from the live document at that moment.
+The same writer makes a document's `.md` when it is exported, with blank lines between blocks
+and links pointed into the export ([document-export.md](document-export.md)).
 Escape returns the caret to the block the selection ended on; a plain click anywhere, or focus
 moving to another control, ends it. Selection is local: nothing is published to other people.
 A selected row's float button opens the selection in one floating view and keeps it
